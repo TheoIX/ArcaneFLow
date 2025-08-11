@@ -1,0 +1,6 @@
+## Interface: 11200
+## Title: ArcaneFlow
+## Notes: Arcane Surge > Arcane Rupture > Arcane Missiles rotation helper for Turtle WoW
+## Author: you
+## Version: 1.0
+ArcaneFlow.lua
