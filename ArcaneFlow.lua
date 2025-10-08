@@ -11,6 +11,9 @@
 -- Buff logic:
 --   • Arcane Rupture will ONLY cast if the "Arcane Rupture" self-aura (buff or debuff) is NOT already active.
 
+-- Surge Uninhibited mode (off by default)
+ArcaneFlow_SurgeUninhibited = false
+
 -- ===== Fast locals =====
 local SpellStopCasting    = SpellStopCasting
 local UnitExists          = UnitExists
@@ -54,6 +57,10 @@ end
 
 -- ===== Surge gating (aura-based) =====
 local function TheoDPS_SurgeAllowed()
+    -- When Surge Uninhibited mode is ON, never inhibit Arcane Surge.
+    if ArcaneFlow_SurgeUninhibited then
+        return true
+    end
     return not TheoDPS_HasAura("Mind Quickening") and not TheoDPS_HasAura("Arcane Power")
 end
 
@@ -313,6 +320,16 @@ end
 -- Register slash command
 SLASH_ARCANEFLOW1 = "/arcane"
 SlashCmdList["ARCANEFLOW"] = ArcaneFlow_Pulse
+
+msg("Loaded. Use |cffffff00/arcane|r in a macro.")
+
+-- Independent toggle: Surge Uninhibited mode (not connected to /storm)
+SLASH_SURGEFREE1 = "/surgefree"
+SlashCmdList["SURGEFREE"] = function()
+    ArcaneFlow_SurgeUninhibited = not ArcaneFlow_SurgeUninhibited
+    local state = ArcaneFlow_SurgeUninhibited and "|cff00ff00ON|r" or "|cffff0000OFF|r"
+    DEFAULT_CHAT_FRAME:AddMessage("|cff7ab0ff[ArcaneFlow]|r Surge Uninhibited mode: " .. state)
+end
 
 msg("Loaded. Use |cffffff00/arcane|r in a macro.")
 
