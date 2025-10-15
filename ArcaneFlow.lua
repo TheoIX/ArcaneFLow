@@ -1,18 +1,26 @@
 -- ArcaneFlow - Turtle WoW 1.12
 -- One-button macro: /arcane
--- Behavior:
---   • After ANY of your spells is resisted, Arcane Surge will fire on the NEXT press (within a short window) if castable.
---   • Surge gating: It will NOT cast while "Mind Quickening" or "Arcane Power" are active on you.
---   • Otherwise: Arcane Rupture > Arcane Missiles (one spell per press).
---   • No 4.8s timer gate; Arcane Missiles simply won't recast while a channel is active (anti-clip only).
---   • While channeling Missiles, spamming the macro will NOT clip it; only Arcane Surge or Arcane Rupture (if its aura is missing) may preempt it.
--- Targeting:
---   • Uses UnitXP("target", "nearestEnemy") from the unitxp DLL to acquire a hostile target.
--- Buff logic:
---   • Arcane Rupture will ONLY cast if the "Arcane Rupture" self-aura (buff or debuff) is NOT already active.
+-- Perfect Rotation toggle: /arcaneflow
+-- Surge gating toggle (global): /surgefree
+-- Surge gating bypass only for PR: /prsurgefree
+--
+-- Perfect Rotation spec (final):
+--   Rupture → Missiles → Missiles → (RESTART with Rupture)
+--   At restart: if Rupture not ready → Surge; if Surge also not ready → Fire Blast (micro-filler) → else wait.
+--   Never add extra Missiles after the 2 fillers.
+--   PoM-before-Rupture only if AP/MQ are NOT up.
+--   Never interrupt channels in PR, EXCEPT:
+--     • If moving, cancel and fall through to instants (Surge → Fire Blast), reset rotation.
+--     • If Rupture aura falls off mid–Missiles and Surge is ready, cancel and Surge immediately; treat as end of rotation.
+--
+-- New in this revision:
+--   • **Castbar-driven channel tracking** (no fixed timers). We watch UnitChannelInfo/pfUI/Blizzard castbar
+--     continuously and count Missiles completions on real channel end. This eliminates haste/timing pauses.
 
--- Surge Uninhibited mode (off by default)
-ArcaneFlow_SurgeUninhibited = false
+-- ===== Mode toggles =====
+ArcaneFlow_SurgeUninhibited     = false -- /surgefree (global)
+ArcaneFlow_PerfectRotation      = false -- /arcaneflow
+ArcaneFlow_PR_SurgeBypassGating = false -- /prsurgefree (let Surge cast in PR even if AP/MQ are up)
 
 -- ===== Fast locals =====
 local SpellStopCasting    = SpellStopCasting
@@ -26,77 +34,19 @@ local GetSpellCooldown    = GetSpellCooldown
 local GetTime             = GetTime
 local CreateFrame         = CreateFrame
 local IsUsableSpell       = IsUsableSpell
-local UnitXP              = UnitXP -- provided by unitxp DLL
+local UnitXP              = UnitXP -- optional DLL
+local UIParent            = UIParent
 local strlower, strfind   = string.lower, string.find
 local BOOK                = BOOKTYPE_SPELL or "spell"
 
--- ===== Aura check utility (buffs & debuffs) =====
-local function TheoDPS_HasAura(name)
-    -- Scan buffs first
-    for i = 1, 40 do
-        GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
-        GameTooltip:ClearLines()
-        GameTooltip:SetUnitBuff("player", i)
-        local text = GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
-        if text and string.find(text, name, 1, true) then
-            return true
-        end
-    end
-    -- Then scan debuffs
-    for i = 1, 40 do
-        GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
-        GameTooltip:ClearLines()
-        GameTooltip:SetUnitDebuff("player", i)
-        local text = GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
-        if text and string.find(text, name, 1, true) then
-            return true
-        end
-    end
-    return false
-end
-
--- ===== Surge gating (aura-based) =====
-local function TheoDPS_SurgeAllowed()
-    -- When Surge Uninhibited mode is ON, never inhibit Arcane Surge.
-    if ArcaneFlow_SurgeUninhibited then
-        return true
-    end
-    return not TheoDPS_HasAura("Mind Quickening") and not TheoDPS_HasAura("Arcane Power")
-end
-
 -- ===== Spells =====
-local SPELL_SURGE    = "Arcane Surge"
-local SPELL_RUPTURE  = "Arcane Rupture"
-local SPELL_MISSILES = "Arcane Missiles"
+local SPELL_SURGE     = "Arcane Surge"
+local SPELL_RUPTURE   = "Arcane Rupture"
+local SPELL_MISSILES  = "Arcane Missiles"
+local SPELL_POM       = "Presence of Mind"
+local SPELL_FIREBLAST = "Fire Blast"
 
-
--- ===== Channel detection (multi-source) =====
-local function IsMissilesChanneling()
-    -- Prefer SuperWoW/TBC-style API if present
-    if type(UnitChannelInfo) == "function" then
-        local name, _, _, _, startTime, endTime = UnitChannelInfo("player")
-        if name == SPELL_MISSILES then
-            if endTime then missilesChannelUntil = (endTime / 1000) end
-            return true
-        end
-    end
-    -- pfUI castbar (best-effort; structure may vary by version)
-    local ok, pf = pcall(function() return pfUI and pfUI.castbar and pfUI.castbar.player end)
-    if ok and pf then
-        local sn = pf.spellname or (pf.label and pf.label.GetText and pf.label:GetText()) or nil
-        if pf.channeling and sn == SPELL_MISSILES then
-            return true
-        end
-    end
-    -- Blizzard casting bar fallback
-    if CastingBarFrame and (CastingBarFrame.channeling or CastingBarFrame.mode == "channel") then
-        -- Can\'t confirm spell name here, but our own logic only channels Missiles
-        return true
-    end
-    return false
-end
-
--- ===== Util =====
+-- ===== Utils =====
 local function msg(txt)
     DEFAULT_CHAT_FRAME:AddMessage("|cff7ab0ff[ArcaneFlow]|r " .. txt)
 end
@@ -119,7 +69,7 @@ end
 
 local function CooldownReady(name)
     local idx = FindHighestRankIndexByName(name)
-    if not idx then return true end -- if not found, don't block
+    if not idx then return true end
     local start, duration, enabled = GetSpellCooldown(idx, BOOK)
     if enabled == 0 then return false end
     if not start or not duration or start == 0 or duration == 0 then return true end
@@ -134,179 +84,319 @@ local function Usable(name)
     return true
 end
 
--- Generic readiness for any spell
 local function CanCast(name)
     return Usable(name) and CooldownReady(name)
 end
 
--- Use unitxp DLL to ensure we have a hostile target
 local function EnsureHostileTarget()
     if not UnitExists("target") or not UnitIsEnemy("player", "target") then
-        -- Replace default targeting with unitxp DLL call
-        UnitXP("target", "nearestEnemy")
+        if type(UnitXP) == "function" then UnitXP("target", "nearestEnemy") end
     end
 end
 
--- ===== Missiles gating & channel state =====
-local chanMissiles   = false       -- true while Missiles is actively channeling
-local wantMissiles   = false       -- set when we attempt to cast Missiles, cleared on start
-local missilesLocked = false       -- soft lock until channel events say we're done
-local missilesLockUntil = 0        -- hard lock timeout (failsafe)
-local missilesGatePending = 0      -- timestamp when we tried to start Missiles; gate applies only if channel actually starts
-local missilesChannelUntil = 0     -- absolute time when Missiles channel should naturally end (anti-clip guard)
+-- ===== Aura detection (buffs & debuffs) =====
+local function TheoDPS_HasAura(name)
+    for i = 1, 40 do
+        GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+        GameTooltip:ClearLines()
+        GameTooltip:SetUnitBuff("player", i)
+        local text = GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
+        if text and string.find(text, name, 1, true) then return true end
+    end
+    for i = 1, 40 do
+        GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+        GameTooltip:ClearLines()
+        GameTooltip:SetUnitDebuff("player", i)
+        local text = GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
+        if text and string.find(text, name, 1, true) then return true end
+    end
+    return false
+end
 
-        -- hard lock timeout (failsafe)
+local function TheoDPS_SurgeAllowed()
+    if ArcaneFlow_SurgeUninhibited then return true end
+    return not TheoDPS_HasAura("Mind Quickening") and not TheoDPS_HasAura("Arcane Power")
+end
+
+-- ===== Channel detection (castbar-driven) =====
+local function IsMissilesChanneling()
+    if type(UnitChannelInfo) == "function" then
+        local name = UnitChannelInfo("player")
+        if name == SPELL_MISSILES then return true end
+    end
+    local ok, pf = pcall(function() return pfUI and pfUI.castbar and pfUI.castbar.player end)
+    if ok and pf then
+        local sn = pf.spellname or (pf.label and pf.label.GetText and pf.label:GetText()) or nil
+        if pf.channeling and sn == SPELL_MISSILES then return true end
+    end
+    if CastingBarFrame and (CastingBarFrame.channeling or CastingBarFrame.mode == "channel") then
+        -- Can't confirm spell name here; assume it's ours due to our own logic
+        return true
+    end
+    return false
+end
+
+-- ===== Movement detection =====
+local moving = false
+local _lastMoveCheck = 0
+local _lastX, _lastY = nil, nil
+
+local function SoftIsMoving()
+    if type(GetUnitSpeed) == "function" then
+        local s = GetUnitSpeed("player")
+        return (s or 0) > 0
+    end
+    if type(GetPlayerMapPosition) == "function" then
+        if type(SetMapToCurrentZone) == "function" then SetMapToCurrentZone() end
+        local x, y = GetPlayerMapPosition("player")
+        if x and y then
+            if _lastX then
+                local dx = x - _lastX; local dy = y - _lastY
+                if (dx*dx + dy*dy) > 0 then _lastX, _lastY = x, y; return true end
+            end
+            _lastX, _lastY = x, y
+        end
+    end
+    return false
+end
+
+local moveFrame = CreateFrame("Frame")
+moveFrame:SetScript("OnUpdate", function()
+    local t = GetTime()
+    if t - _lastMoveCheck > 0.10 then
+        moving = SoftIsMoving()
+        _lastMoveCheck = t
+    end
+end)
+
+-- ===== PR STATE MACHINE =====
+-- pr_state meanings:
+--   0 = need Rupture (start of cycle)
+--   1 = Missiles #1 completed
+--   2 = Missiles #2 completed (RESTART point → try Rupture)
+local pr_state = 0
+local afterRupture = false -- prevents double Rupture; true right after Rupture completes until we start Missiles
+
+-- Robust Missiles completion accounting (castbar-driven)
+local chanMissiles     = false
+local wantMissiles     = false
+local missilesPending  = false   -- we issued Missiles and are waiting for real channel start/stop
+local skipMissilesComplete = false -- set true when we cancel/interrupt so the next stop doesn’t count
+
+local pendingRupture   = false
+
+local function BeginMissiles()
+    wantMissiles        = true
+    missilesPending     = true
+end
+
+local function ClearMissilesFlags()
+    missilesPending     = false
+    chanMissiles        = false
+    wantMissiles        = false
+end
+
+local function MarkMissilesCompleted()
+    ClearMissilesFlags()
+    afterRupture = false
+    if pr_state < 2 then pr_state = pr_state + 1 end
+end
 
 local function CastNow(name)
     EnsureHostileTarget()
     local idx = FindHighestRankIndexByName(name)
-    if idx then
-        CastSpell(idx, BOOK)
-    else
-        CastSpellByName(name)
-    end
+    if idx then CastSpell(idx, BOOK) else CastSpellByName(name) end
     if name == SPELL_MISSILES then
-        wantMissiles      = true  -- expect a channel start next
-        missilesLocked    = true  -- prevent re-casting / clipping until channel ends
-        missilesLockUntil = GetTime() + 5.2 -- hard lock (approx channel length)
-        missilesGatePending = GetTime() -- don't start the 4.8s gate until channel actually begins
-    elseif name == SPELL_RUPTURE or name == SPELL_SURGE then
-        -- no timer gate to reset
+        BeginMissiles()
+    elseif name == SPELL_RUPTURE then
+        pendingRupture = true
     end
 end
 
--- ===== Resist -> Surge arming =====
-local surgeArmedUntil = 0      -- timestamp; if > GetTime() then armed
-local ARM_WINDOW = 6.0         -- seconds to keep the flag after a resist
-
+-- ===== Events =====
 local f = CreateFrame("Frame")
--- Combat log (your damage): partial & full resists
 f:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE")
 f:RegisterEvent("CHAT_MSG_SPELL_SELF_MISSES")
--- Channel tracking: mark when Missiles actually starts/ends channeling
 f:RegisterEvent("SPELLCAST_CHANNEL_START")
-f:RegisterEvent("SPELLCAST_START") -- some 1.12 cores fire START even for channels
 f:RegisterEvent("SPELLCAST_CHANNEL_STOP")
-f:RegisterEvent("SPELLCAST_STOP") -- observed on some cores; we won't unlock from this alone for channels
+f:RegisterEvent("SPELLCAST_START")
+f:RegisterEvent("SPELLCAST_STOP")
 f:RegisterEvent("SPELLCAST_FAILED")
+f:RegisterEvent("SPELLCAST_INTERRUPTED")
+
+local surgeArmedUntil = 0
+local ARM_WINDOW = 6.0
 
 f:SetScript("OnEvent", function()
-    local e = event -- 1.12 provides global 'event' and 'arg1'
+    local e = event
     if e == "CHAT_MSG_SPELL_SELF_DAMAGE" or e == "CHAT_MSG_SPELL_SELF_MISSES" then
-        local m = arg1
-        if type(m) == "string" and m ~= "" then
-            local lm = strlower(m)
-            if strfind(lm, "your ", 1, true) and strfind(lm, "resist", 1, true) then
-                surgeArmedUntil = GetTime() + ARM_WINDOW
+        if not ArcaneFlow_PerfectRotation then
+            local m = arg1
+            if type(m) == "string" and m ~= "" then
+                local lm = strlower(m)
+                if strfind(lm, "your ", 1, true) and strfind(lm, "resist", 1, true) then
+                    surgeArmedUntil = GetTime() + ARM_WINDOW
+                end
             end
         end
         return
     end
 
     if e == "SPELLCAST_CHANNEL_START" or e == "SPELLCAST_START" then
-        -- Only treat as Missiles channel if we *intended* to cast Missiles
         if wantMissiles then
-            chanMissiles         = true
-            missilesLocked       = true
-            missilesLockUntil    = GetTime() + 5.2
-            missilesGatePending  = 0
-            missilesChannelUntil = GetTime() + 5.2          -- hard anti-clip timer; only Surge may preempt
+            chanMissiles = true
+            wantMissiles = false
         end
-        wantMissiles = false
         return
     end
 
-    if e == "SPELLCAST_CHANNEL_STOP" or e == "SPELLCAST_FAILED" then
-        -- If Missiles failed to start (no channel) after we attempted it, cancel pending gate
-        if (e == "SPELLCAST_FAILED" or not chanMissiles) and missilesGatePending > 0 then
-            missilesGatePending = 0
+    if e == "SPELLCAST_CHANNEL_STOP" then
+        if chanMissiles or missilesPending then
+            if skipMissilesComplete then
+                skipMissilesComplete = false
+                ClearMissilesFlags()
+            else
+                MarkMissilesCompleted()
+            end
         end
-        chanMissiles         = false
-        wantMissiles         = false
-        missilesLocked       = false
-        missilesLockUntil    = 0
-        missilesChannelUntil = 0
         return
     end
 
-    if e == "SPELLCAST_STOP" then
-        -- Some cores fire STOP during channels too; do NOT unlock here unless we weren't channeling
-        if not chanMissiles then
-            wantMissiles         = false
-            missilesLocked       = false
-            missilesLockUntil    = 0
-            missilesChannelUntil = 0
+    if e == "SPELLCAST_INTERRUPTED" then
+        if chanMissiles or missilesPending then
+            skipMissilesComplete = true
+            ClearMissilesFlags()
+            -- reset rotation on interruption
+            pr_state = 0; afterRupture = false
+        end
+        return
+    end
+
+    if e == "SPELLCAST_STOP" or e == "SPELLCAST_FAILED" then
+        if pendingRupture then
+            if e == "SPELLCAST_STOP" then
+                -- Rupture successfully completed → begin Missiles stage next
+                afterRupture = true
+                pr_state = 0 -- zero missiles done so far
+            end
+            pendingRupture = false
+        end
+        -- Missiles FAILED: clear flags (no state advance)
+        if e == "SPELLCAST_FAILED" and (chanMissiles or missilesPending) then
+            skipMissilesComplete = true
+            ClearMissilesFlags()
         end
         return
     end
 end)
 
--- ===== Main pulse =====
-function ArcaneFlow_Pulse()
+-- Extra: castbar-driven monitor to catch channel end even if no STOP fires
+local lastChan = false
+local mon = CreateFrame("Frame")
+mon:SetScript("OnUpdate", function()
+    local isChan = IsMissilesChanneling()
+    if isChan and not lastChan then
+        -- started (may not always see START)
+        chanMissiles = true
+        missilesPending = false
+    elseif (not isChan) and lastChan then
+        -- ended (treat as completion unless we purposely cancelled)
+        if skipMissilesComplete then
+            skipMissilesComplete = false
+            ClearMissilesFlags()
+        elseif chanMissiles then
+            MarkMissilesCompleted()
+        end
+    end
+    lastChan = isChan
+end)
+
+-- ===== PERFECT ROTATION PULSE =====
+local function ArcaneFlow_PulsePerfect()
     local now = GetTime()
 
-    -- If we tried to start Missiles but no channel began shortly after, clear the soft lock and pending gate
-    if missilesGatePending > 0 and (now - missilesGatePending) > 0.7 and not chanMissiles then
-        missilesLocked = false
-        wantMissiles = false
-        missilesGatePending = 0
-    end
-
-    -- HARD anti-clip: if Missiles should still be channeling, do nothing (only Surge may preempt)
-    if missilesChannelUntil > 0 and now < missilesChannelUntil then
-        -- Allow Surge to preempt even during channel
-        if now < surgeArmedUntil and TheoDPS_SurgeAllowed() and CanCast(SPELL_SURGE) then
+    -- While channeling Missiles: only narrow exceptions apply
+    if IsMissilesChanneling() or chanMissiles then
+        -- Movement: cancel channel, reset, and use instants
+        if moving then
+            skipMissilesComplete = true
             SpellStopCasting()
+            ClearMissilesFlags()
+            pr_state = 0; afterRupture = false
+            if (ArcaneFlow_PR_SurgeBypassGating or TheoDPS_SurgeAllowed()) and CanCast(SPELL_SURGE) then CastNow(SPELL_SURGE); return end
+            if CanCast(SPELL_FIREBLAST) then CastNow(SPELL_FIREBLAST); return end
+            return
+        end
+        -- Rupture aura dropped mid-channel → Surge immediately (end of rotation, park at restart)
+        if (not TheoDPS_HasAura(SPELL_RUPTURE)) and (ArcaneFlow_PR_SurgeBypassGating or TheoDPS_SurgeAllowed()) and CanCast(SPELL_SURGE) then
+            skipMissilesComplete = true
+            SpellStopCasting()
+            ClearMissilesFlags()
             CastNow(SPELL_SURGE)
-            surgeArmedUntil = 0
-            missilesLocked  = false
-            chanMissiles    = false
-            wantMissiles    = false
+            pr_state = 2 -- park at restart; Rupture next
             return
         end
-        -- Allow Rupture to preempt if its aura is missing and spell is castable
-        if not TheoDPS_HasAura("Arcane Rupture") and CanCast(SPELL_RUPTURE) then
-            SpellStopCasting()
-            CastNow(SPELL_RUPTURE)
-            missilesLocked  = false
-            chanMissiles    = false
-            wantMissiles    = false
-            return
-        end
+        -- Otherwise, don't clip
         return
     end
 
+    -- Movement-aware: while moving but not channeling, prefer instants and reset rotation
+    if moving then
+        pr_state = 0; afterRupture = false
+        if (ArcaneFlow_PR_SurgeBypassGating or TheoDPS_SurgeAllowed()) and CanCast(SPELL_SURGE) then CastNow(SPELL_SURGE); return end
+        if CanCast(SPELL_FIREBLAST) then CastNow(SPELL_FIREBLAST); return end
+        return
+    end
 
+    -- Restart point: try Rupture → Surge → Fire Blast → wait
+    if pr_state >= 2 then
+        if CanCast(SPELL_RUPTURE) then
+            if not (TheoDPS_HasAura("Arcane Power") or TheoDPS_HasAura("Mind Quickening")) and CanCast(SPELL_POM) then CastNow(SPELL_POM); return end
+            CastNow(SPELL_RUPTURE)
+            return
+        end
+        if (ArcaneFlow_PR_SurgeBypassGating or TheoDPS_SurgeAllowed()) and CanCast(SPELL_SURGE) then CastNow(SPELL_SURGE); return end
+        if CanCast(SPELL_FIREBLAST) then CastNow(SPELL_FIREBLAST); return end
+        return
+    end
 
-    -- If a recent resist occurred, try Surge on THIS press when it's actually castable
+    -- Build up exactly two Missiles between Ruptures
+    if pr_state < 2 then
+        -- Start of cycle: Rupture first, but only if we haven't just finished one
+        if pr_state == 0 and (not afterRupture) and CanCast(SPELL_RUPTURE) then
+            if not (TheoDPS_HasAura("Arcane Power") or TheoDPS_HasAura("Mind Quickening")) and CanCast(SPELL_POM) then CastNow(SPELL_POM); return end
+            CastNow(SPELL_RUPTURE)
+            return
+        end
+        -- Otherwise cast Missiles to progress to 1 then 2
+        if CanCast(SPELL_MISSILES) then
+            afterRupture = false
+            CastNow(SPELL_MISSILES)
+            return
+        end
+        -- Tiny fall-through to avoid idle if Missiles not immediately castable
+        if CanCast(SPELL_FIREBLAST) then CastNow(SPELL_FIREBLAST); return end
+        return
+    end
+end
+
+-- ===== DEFAULT PULSE (legacy behavior when PR is OFF) =====
+function ArcaneFlow_Pulse()
+    if ArcaneFlow_PerfectRotation then
+        return ArcaneFlow_PulsePerfect()
+    end
+
+    local now = GetTime()
+
+    -- legacy: cast Rupture if aura missing; otherwise Missiles; Surge on resist-armed
     if now < surgeArmedUntil and TheoDPS_SurgeAllowed() and CanCast(SPELL_SURGE) then
         SpellStopCasting()
         CastNow(SPELL_SURGE)
         surgeArmedUntil = 0
-        missilesLocked  = false
-        chanMissiles    = false
-        wantMissiles    = false
         return
     end
 
-    -- If Missiles is channeling OR locked pending its channel start, do nothing (avoid clipping)
-    if IsMissilesChanneling() or chanMissiles or missilesLocked or (CastingBarFrame and CastingBarFrame.channeling) then
-        -- Preempt with Rupture if its aura dropped and it is castable
-        if not TheoDPS_HasAura("Arcane Rupture") and CanCast(SPELL_RUPTURE) then
-            SpellStopCasting()
-            CastNow(SPELL_RUPTURE)
-            missilesLocked  = false
-            chanMissiles    = false
-            wantMissiles    = false
-            return
-        end
-        -- failsafe: clear stale lock after timeout
-        if missilesLocked and now > missilesLockUntil then missilesLocked = false end
-        return
-    end
-
-    -- Priority: Rupture (only if NOT already active), then (gated) Missiles
-    if not TheoDPS_HasAura("Arcane Rupture") and CanCast(SPELL_RUPTURE) then
+    if not TheoDPS_HasAura(SPELL_RUPTURE) and CanCast(SPELL_RUPTURE) then
         CastNow(SPELL_RUPTURE)
         return
     end
@@ -317,20 +407,33 @@ function ArcaneFlow_Pulse()
     end
 end
 
--- Register slash command
+-- ===== SLASH COMMANDS =====
 SLASH_ARCANEFLOW1 = "/arcane"
 SlashCmdList["ARCANEFLOW"] = ArcaneFlow_Pulse
 
-msg("Loaded. Use |cffffff00/arcane|r in a macro.")
+SLASH_ARCANEFLOWMODE1 = "/arcaneflow"
+SlashCmdList["ARCANEFLOWMODE"] = function()
+    ArcaneFlow_PerfectRotation = not ArcaneFlow_PerfectRotation
+    local state = ArcaneFlow_PerfectRotation and "|cff00ff00ON|r" or "|cffff0000OFF|r"
+    DEFAULT_CHAT_FRAME:AddMessage("|cff7ab0ff[ArcaneFlow]|r Perfect Rotation mode: " .. state)
+    if ArcaneFlow_PerfectRotation then
+        DEFAULT_CHAT_FRAME:AddMessage("|cff7ab0ff[ArcaneFlow]|r PR: Rupture → Missiles ×2 → (Rupture restart). Fallbacks: Surge → Fire Blast → wait. Castbar-driven channels.")
+    end
+end
 
--- Independent toggle: Surge Uninhibited mode (not connected to /storm)
 SLASH_SURGEFREE1 = "/surgefree"
 SlashCmdList["SURGEFREE"] = function()
     ArcaneFlow_SurgeUninhibited = not ArcaneFlow_SurgeUninhibited
     local state = ArcaneFlow_SurgeUninhibited and "|cff00ff00ON|r" or "|cffff0000OFF|r"
-    DEFAULT_CHAT_FRAME:AddMessage("|cff7ab0ff[ArcaneFlow]|r Surge Uninhibited mode: " .. state)
+    DEFAULT_CHAT_FRAME:AddMessage("|cff7ab0ff[ArcaneFlow]|r Surge Uninhibited (global): " .. state)
 end
 
-msg("Loaded. Use |cffffff00/arcane|r in a macro.")
+SLASH_PRSURGEFREE1 = "/prsurgefree"
+SlashCmdList["PRSURGEFREE"] = function()
+    ArcaneFlow_PR_SurgeBypassGating = not ArcaneFlow_PR_SurgeBypassGating
+    local state = ArcaneFlow_PR_SurgeBypassGating and "|cff00ff00ON|r" or "|cffff0000OFF|r"
+    DEFAULT_CHAT_FRAME:AddMessage("|cff7ab0ff[ArcaneFlow]|r PR Surge Bypass Gating: " .. state)
+end
 
+msg("Loaded. Use /arcane. Toggle Perfect Rotation with /arcaneflow.")
 
