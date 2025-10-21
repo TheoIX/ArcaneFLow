@@ -167,3 +167,155 @@ SLASH_ARCNEW1 = "/arcnew"
 SlashCmdList["ARCNEW"] = ArcaneRuptureLite_Pulse
 
 msg("Loaded. Use /arcnew for aura‑driven rotation (Rupture → Missiles; fallbacks when aura is missing).")
+
+
+-- ============================================================================
+-- ArcanePrep.lua – Consumable/Trinket/Spell prep macro
+-- One‑button macro: /arcprep
+-- Order:
+--   1) If missing buff "Potion of Quickness" → use item "Potion of Quickness" from bags.
+--   2) If missing buff "Juju Flurry" → temporarily target self, use item "Juju Flurry", then restore target.
+--   3) Use trinket in inventory slot 13 (upper trinket).
+--   4) Lastly, cast Arcane Power (if off CD).
+-- Each press performs the FIRST available action in this list and returns (to respect GCD).
+
+local function PP_msg(txt)
+  DEFAULT_CHAT_FRAME:AddMessage("|cff7ab0ff[ArcPrep]|r " .. txt)
+end
+
+-- Tooltip‑based buff check (substring match of buff name)
+local function HasPlayerBuff(name, exact)
+  for i = 1, 40 do
+    GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+    GameTooltip:ClearLines()
+    GameTooltip:SetUnitBuff("player", i)
+    local t = GameTooltipTextLeft1 and GameTooltipTextLeft1:GetText()
+    if t then
+      if exact then
+        if t == name then return true end
+      else
+        if string.find(t, name, 1, true) then return true end
+      end
+    end
+  end
+  return false
+end
+
+-- Bag scan + use item by (partial) name; honors item cooldown
+local function UseBagItemByName(name)
+  for bag = 0, 4 do
+    local slots = GetContainerNumSlots(bag)
+    if slots then
+      for slot = 1, slots do
+        local link = GetContainerItemLink(bag, slot)
+        if link and string.find(link, name, 1, true) then
+          local start, duration, enable = GetContainerItemCooldown(bag, slot)
+          if enable ~= 0 and (not start or duration == 0 or (start + duration - GetTime()) <= 0) then
+            UseContainerItem(bag, slot)
+            return true
+          end
+        end
+      end
+    end
+  end
+  return false
+end
+
+-- Trinket use helper (13 = upper trinket)
+local function UseTrinket(slot)
+  local start, duration, enable = GetInventoryItemCooldown("player", slot)
+  if enable == 0 then return false end
+  if not start or duration == 0 or (start + duration - GetTime()) <= 0 then
+    UseInventoryItem(slot)
+    return true
+  end
+  return false
+end
+
+-- Spell cast helper (no ranks)
+local function CastIfReady(spell)
+  local idx
+  for i = 1, 300 do
+    local n = GetSpellName(i, BOOKTYPE_SPELL or "spell")
+    if not n then break end
+    if n == spell then idx = i end
+  end
+  if not idx then return false end
+  local start, duration, enabled = GetSpellCooldown(idx, BOOKTYPE_SPELL or "spell")
+  if enabled == 0 then return false end
+  if not start or duration == 0 or (start + duration - GetTime()) <= 0 then
+    CastSpell(idx, BOOKTYPE_SPELL or "spell")
+    return true
+  end
+  return false
+end
+
+-- Target self temporarily and run an action, then restore prior target
+local function DoOnSelf(action)
+  local hadTarget = UnitExists("target")
+  local prevName = hadTarget and UnitName("target") or nil
+
+  -- Try Blizzard self-target first
+  TargetUnit("player")
+
+  -- Fallback: explicit self by name (mirrors /target <playerName>)
+  local me = UnitName("player")
+  local cur = UnitName("target")
+  if me and (not cur or cur ~= me) then
+    TargetByName(me, true)
+  end
+
+  local ok = action()
+
+  if hadTarget and prevName then
+    TargetByName(prevName, true)
+  else
+    ClearTarget()
+  end
+  return ok
+end
+
+function ArcPrep_Pulse()
+  -- 1) Potion of Quickness buff → ensure present
+  if not HasPlayerBuff("Potion of Quickness") then
+    if UseBagItemByName("Potion of Quickness") then
+      PP_msg("Using Potion of Quickness")
+      return
+    end
+  end
+
+  -- 2) Juju Flurry buff → ensure present (target self before using)
+  if not HasPlayerBuff("Juju Flurry") then
+    local ok = DoOnSelf(function()
+      return UseBagItemByName("Juju Flurry")
+    end)
+    if ok then
+      PP_msg("Using Juju Flurry")
+      return
+    end
+  end
+
+  -- 3) Use trinket in slot 13 (only if Mind Quickening buff not already active)
+  if not HasPlayerBuff("Mind Quickening") then
+    if UseTrinket(13) then
+      PP_msg("Activating Trinket (slot 13)")
+      return
+    end
+  end
+
+  -- 4) Cast Arcane Power (only if AP buff not already active)
+  if not HasPlayerBuff("Arcane Power", true) then
+    if CastIfReady("Arcane Power") then
+      PP_msg("Casting Arcane Power")
+      return
+    end
+  end
+
+  -- Nothing done
+  PP_msg("Nothing to do (all buffs/cooldowns busy)")
+end
+
+SLASH_ARCPREP1 = "/arcprep"
+SlashCmdList["ARCPREP"] = ArcPrep_Pulse
+PP_msg("Loaded. Use /arcprep to apply Quickness → Flurry → Trinket13 → Arcane Power (first available per press).")
+
