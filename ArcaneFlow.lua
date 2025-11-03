@@ -29,6 +29,13 @@ local UIParent            = UIParent
 local strfind             = string.find
 local BOOK                = BOOKTYPE_SPELL or "spell"
 
+-- Target-swap grace (prevents AM from idling on a new target)
+local ArcFlow_LastSwap = 0
+local ARC_SWAP_GRACE = 0.5
+local function ArcFlow_RecentlySwapped()
+  return (GetTime() - ArcFlow_LastSwap) <= ARC_SWAP_GRACE
+end
+
 -- ===== Spells =====
 local SPELL_SURGE     = "Arcane Surge"
 local SPELL_RUPTURE   = "Arcane Rupture"
@@ -39,6 +46,14 @@ local SPELL_FIREBLAST = "Fire Blast"
 local function msg(txt)
   DEFAULT_CHAT_FRAME:AddMessage("|cff7ab0ff[ArcaneRuptureLite]|r " .. txt)
 end
+
+local ArcFlowSwapEvt = CreateFrame("Frame")
+ArcFlowSwapEvt:RegisterEvent("PLAYER_TARGET_CHANGED")
+ArcFlowSwapEvt:SetScript("OnEvent", function()
+  ArcFlow_LastSwap = GetTime()
+  -- optional: if you have an anti-stick AM timer, clear it here
+  if lastAMSeen then lastAMSeen = 0 end
+end)
 
 -- Find the HIGHEST‑RANK index for a spell name in the spellbook (1.12 API)
 local spellIndexCache = {}
@@ -81,6 +96,15 @@ local function EnsureHostileTarget()
   if not UnitExists("target") or not UnitIsEnemy("player", "target") then
     if type(UnitXP) == "function" then UnitXP("target", "nearestEnemy") end
   end
+end
+
+-- Cooldown check using highest-rank spellbook index (1.12-safe)
+local function IsOnCooldown(spellName)
+  local idx = FindHighestRankIndexByName(spellName)
+  if not idx then return false end
+  local start, duration, enable = GetSpellCooldown(idx, BOOK)
+  return (enable ~= 0) and start and duration and start > 0 and duration > 0
+         and (start + duration - GetTime()) > 0
 end
 
 -- ===== Aura detection (tooltip scan over player buffs/debuffs) =====
@@ -129,35 +153,54 @@ local function CastNow(name)
   if idx then CastSpell(idx, BOOK) else CastSpellByName(name) end
 end
 
+-- Player Rupture aura check (alias to existing HasAura)
+local function PlayerHasRupture()
+  return HasAura(SPELL_RUPTURE)
+end
+
 -- ===== Core pulse =====
 function ArcaneRuptureLite_Pulse()
-  -- If we are channeling Missiles, do nothing unless we’re allowed to Surge (exception)
-  if IsMissilesChanneling() then
-    -- While channeling: only break if the aura is missing and we can Rupture or Surge
-    if not HasAura(SPELL_RUPTURE) then
-      local canRupture = CanCast(SPELL_RUPTURE)
-      local canSurge   = CanCast(SPELL_SURGE)
-      if canRupture or canSurge then
-        SpellStopCasting()
-        if canRupture then
-          CastNow(SPELL_RUPTURE)
-        else
-          CastNow(SPELL_SURGE)
-        end
-      end
+  -- (keep your existing target/hostile checks)
+
+  local haveRup   = PlayerHasRupture()     -- your existing aura check
+  local rupOnCD   = IsOnCooldown(SPELL_RUPTURE)
+
+  -- If we DON'T have the Rupture buff and it's cooling,
+  -- immediately rotate Surge -> Fire Blast -> AM (filler) until Rupture is ready again.
+  if not haveRup and rupOnCD then
+    -- if we just swapped targets, kill any leftover AM channel to avoid “stuck” idling
+    if ArcFlow_RecentlySwapped() and IsMissilesChanneling and IsMissilesChanneling() then
+      SpellStopCasting()
     end
+    if CanCast(SPELL_SURGE)     then CastNow(SPELL_SURGE);     return end
+    if CanCast(SPELL_FIREBLAST) then CastNow(SPELL_FIREBLAST); return end
+    if CanCast(SPELL_MISSILES)  then CastNow(SPELL_MISSILES);  return end
     return
   end
 
-  -- Aura present → only cast Missiles
-  if HasAura(SPELL_RUPTURE) then
-    if CanCast(SPELL_MISSILES) then CastNow(SPELL_MISSILES) end
+  -- If channeling AM and Rupture just became ready while we still don't have the buff, snap into it
+  if IsMissilesChanneling and IsMissilesChanneling() then
+    if not haveRup and not rupOnCD and CanCast(SPELL_RUPTURE) then
+      SpellStopCasting()
+      CastNow(SPELL_RUPTURE)
+      return
+    end
+    return -- otherwise keep channeling
+  end
+
+  -- Normal branches
+  if haveRup then
+    if CanCast(SPELL_MISSILES)  then CastNow(SPELL_MISSILES);  return end
+    if CanCast(SPELL_SURGE)     then CastNow(SPELL_SURGE);     return end
+    if CanCast(SPELL_FIREBLAST) then CastNow(SPELL_FIREBLAST); return end
     return
   end
 
-  -- Aura missing → Rupture → Surge → Fire Blast → Missiles (then wait)
-  if CanCast(SPELL_RUPTURE) then CastNow(SPELL_RUPTURE); return end
-  if CanCast(SPELL_SURGE)   then CastNow(SPELL_SURGE);   return end
+  -- We don't have the Rupture buff and it's NOT on cooldown → apply it now
+  if CanCast(SPELL_RUPTURE)   then CastNow(SPELL_RUPTURE);   return end
+
+  -- Safety fallback if Rupture is busy/unusable right this instant
+  if CanCast(SPELL_SURGE)     then CastNow(SPELL_SURGE);     return end
   if CanCast(SPELL_FIREBLAST) then CastNow(SPELL_FIREBLAST); return end
   if CanCast(SPELL_MISSILES)  then CastNow(SPELL_MISSILES);  return end
 end
@@ -318,4 +361,5 @@ end
 SLASH_ARCPREP1 = "/arcprep"
 SlashCmdList["ARCPREP"] = ArcPrep_Pulse
 PP_msg("Loaded. Use /arcprep to apply Quickness → Flurry → Trinket13 → Arcane Power (first available per press).")
+
 
